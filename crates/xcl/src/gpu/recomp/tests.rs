@@ -9359,9 +9359,15 @@ fn bvh_intersect_dxil_has_zero_allocas_and_validates() {
 /// `box32` and `box16` with `sort = true` and `sort = false`, plus GPURT triangle types 0..3.
 #[test]
 fn gpu_bvh_intersect_scalar_matches_reference() {
-    let waves = gpu_waves();
-    if waves.is_empty() {
+    if !gpu_ready() {
         return;
+    }
+    let mut waves = Vec::new();
+    if runner::wave32_supported() == Ok(true) {
+        waves.extend([(false, false), (true, true)]);
+    }
+    if runner::wave64_supported() == Ok(true) {
+        waves.push((true, false));
     }
     let base = 0x1000usize;
     let mut mem = vec![0u32; 0x3000 / 4];
@@ -9390,7 +9396,18 @@ fn gpu_bvh_intersect_scalar_matches_reference() {
     }
     w(0x380, &ff(&[-1.0, -1.0, 5.0, 1.0, -1.0, 5.0, -1.0, 1.0, 5.0, 1.0, 1.0, 5.0, 0.0, 2.0, 5.0]));
     w(0x380 + 60, &[0x09_09_09_09]);
-    let (tri0, tri3) = (0x380u32 >> 3, (0x380u32 >> 3) | 3);
+    let tri_base = 0x380u32 >> 3;
+    let miss = [f32::INFINITY, 1.0, 0.0, 0.0];
+    let tri_cases = [
+        (tri_base, [-0.5f32, -0.5, 0.0], [-20.0, -4.0, -1.0, -1.0]),
+        (tri_base | 1, [0.5, 0.5, 0.0], [-20.0, -4.0, -2.0, -1.0]),
+        (tri_base | 2, [0.0, 1.5, 0.0], [-10.0, -2.0, -0.5, -1.0]),
+        (tri_base | 3, [-0.5, 1.0, 0.0], [10.0, 2.0, 1.0, 0.5]),
+        (tri_base, [3.0, 3.0, 0.0], miss),
+        (tri_base | 1, [3.0, 3.0, 0.0], miss),
+        (tri_base | 2, [3.0, 3.0, 0.0], miss),
+        (tri_base | 3, [3.0, 3.0, 0.0], miss),
+    ];
 
     let mimg = |vdata: u64, vaddr: u64, srsrc: u64| encode("IMAGE_BVH_INTERSECT_RAY", "ENC_MIMG", &[("VDATA", vdata), ("VADDR", vaddr), ("SRSRC", srsrc), ("DMASK", 15)], None).unwrap();
     let code = [mimg(100, 0, 2), mimg(104, 0, 3), mimg(108, 20, 2), encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap()].concat();
@@ -9411,7 +9428,7 @@ fn gpu_bvh_intersect_scalar_matches_reference() {
         (b_inside, [0.5, -2.0, 0.0], py, 100.0, [0xF8, 0xF9, u32::MAX, u32::MAX], [0xF8, 0xF9, u32::MAX, u32::MAX]),
     ];
 
-    for wave64 in waves {
+    for (wave64, split_wave64) in waves {
         let mut st = KernelState::default();
         st.sgpr[8..12].copy_from_slice(&[(base >> 8) as u32, 1 << 31, u32::MAX, 0]);
         st.sgpr[12..16].copy_from_slice(&[(base >> 8) as u32, 0, u32::MAX, 0]);
@@ -9425,19 +9442,24 @@ fn gpu_bvh_intersect_scalar_matches_reference() {
         for (l, r) in st.vgpr.iter_mut().enumerate().take(nlanes) {
             let (node, o, (d, inv), tmax, ..) = cases[l % cases.len()];
             put_ray(r, 0, node, tmax, o, d, inv);
-            let (tn, to) = match l % 3 { 0 => (tri0, [-0.5f32, -0.5, 0.0]), 1 => (tri3, [-0.5f32, 1.0, 0.0]), _ => (tri0, [3.0f32, 3.0, 0.0]) };
+            let (tn, to, _) = tri_cases[l % tri_cases.len()];
             put_ray(r, 20, tn, 100.0, to, pz.0, pz.1);
         }
-        let (dxil, _) = kernel_wave(&code, wave64);
+        let opt = Options { wave64, split_wave64, ..Default::default() };
+        let t = translate(&code, &opt).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
         let res = runner::run(&dxil, &st, &mem).unwrap();
         for l in 0..nlanes {
             let (node, _, _, tmax, exp_sort, exp_nosort) = cases[l % cases.len()];
             let (got_sort, got_nosort): ([u32; 4], [u32; 4]) = (res.vgpr[l][100..104].try_into().unwrap(), res.vgpr[l][104..108].try_into().unwrap());
-            assert_eq!(got_sort, exp_sort, "wave64={wave64} lane {l} node {node:#x} tmax {tmax}: sort=true");
-            assert_eq!(got_nosort, exp_nosort, "wave64={wave64} lane {l} node {node:#x} tmax {tmax}: sort=false");
-            let tri: [f32; 4] = <[u32; 4]>::try_from(&res.vgpr[l][108..112]).unwrap().map(f32::from_bits);
-            assert!(if l % 3 == 2 { tri[0].is_infinite() } else { (tri[0] / tri[1] - 5.0).abs() < 1e-4 }, "wave64={wave64} lane {l}: tri={tri:?}");
+            assert_eq!(got_sort, exp_sort, "wave64={wave64} split_wave64={split_wave64} lane {l} node {node:#x} tmax {tmax}: sort=true");
+            assert_eq!(got_nosort, exp_nosort, "wave64={wave64} split_wave64={split_wave64} lane {l} node {node:#x} tmax {tmax}: sort=false");
+            let tri: [u32; 4] = res.vgpr[l][108..112].try_into().unwrap();
+            let (node, _, expected) = tri_cases[l % tri_cases.len()];
+            assert_eq!(tri, expected.map(f32::to_bits), "wave64={wave64} split_wave64={split_wave64} lane {l} triangle {}", node & 7);
         }
+        println!("BVH reference: wave64={wave64} split_wave64={split_wave64} lanes={nlanes}");
     }
 }
 
