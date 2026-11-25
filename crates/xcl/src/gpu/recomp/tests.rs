@@ -9499,6 +9499,9 @@ fn bench_cold_bvh_intersect_pso() {
         dev9.ShaderCacheControl(kinds, D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE)
     });
     println!("adapter={gpu_name} cache_disable={cache_ctrl:?}");
+    if cache_ctrl.is_err() {
+        println!("Implicit driver cache state is unverified; reporting first and repeat PSO calls, not proven cold timings.");
+    }
 
     let commit_mb = || unsafe {
         let mut c: PROCESS_MEMORY_COUNTERS_EX = std::mem::zeroed();
@@ -9541,6 +9544,9 @@ fn bench_cold_bvh_intersect_pso() {
         let dxc_t0 = std::time::Instant::now();
         let dxil = super::dxc::compile(hlsl, "main", "cs_6_6", extra).unwrap();
         let dxc_ms = dxc_t0.elapsed().as_secs_f64() * 1000.0;
+        crate::gpu::dxil::validate::validate(&dxil).unwrap();
+        let hash = dxil.iter().fold(0xcbf29ce484222325u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x100000001b3));
+        println!("    hlsl_bytes={} dxil_fnv1a={hash:016x} args={extra:?}", hlsl.len());
         let ir = crate::gpu::dxil::validate::disassemble(&dxil).unwrap();
         let lines = ir.lines().count();
         let allocas = ir.lines().filter(|l| l.contains(" alloca ")).count();
@@ -9562,10 +9568,10 @@ fn bench_cold_bvh_intersect_pso() {
             drop(pso);
             ms
         };
-        let cold_ms = time_pso();
+        let first_ms = time_pso();
         let c1 = commit_mb();
-        let warm_ms = time_pso();
-        (dxil.len(), lines, allocas, geps, brs, phis, dxc_ms, cold_ms, warm_ms, c1 - c0)
+        let repeat_ms = time_pso();
+        (dxil.len(), lines, allocas, geps, brs, phis, dxc_ms, first_ms, repeat_ms, c1 - c0)
     };
 
     let baseline_fn = r#"uint4 bvh_intersect(uint type, uint at, float tmax, float3 o, float3 d, float3 inv, bool sort) {
@@ -9622,23 +9628,30 @@ fn bench_cold_bvh_intersect_pso() {
 
     let median = |mut v: Vec<f64>| {
         v.sort_by(f64::total_cmp);
-        v[v.len() / 2]
+        (v[(v.len() - 1) / 2] + v[v.len() / 2]) / 2.0
     };
 
     let print_row = |tag: &str, run: u32, r: &(usize, usize, usize, usize, usize, usize, f64, f64, f64, f64)| {
-        println!("  run {run}: {tag:<5} dxil={:6}B lines={:5} alloca={:3} gep={:4} br={:4} phi={:4} dxc={:6.1}ms cold_pso={:7.2}ms warm={:5.2}ms commit={:+.1}MB", r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7, r.8, r.9);
+        println!("  run {run}: {tag:<5} dxil={:6}B lines={:5} alloca={:3} gep={:4} br={:4} phi={:4} dxc={:6.1}ms first_pso={:7.2}ms repeat={:5.2}ms commit={:+.1}MB", r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7, r.8, r.9);
     };
 
-    for (extra_label, extra) in [("O3", &[][..]), ("O1", &["-O1"][..]), ("O0", &["-O0", "-opt-disable", "debug-nops"][..])] {
+    for (mode_index, (extra_label, extra)) in [("O3", &["-O3"][..]), ("O1", &["-O1"][..]), ("O0", &["-O0", "-opt-disable", "debug-nops"][..])].into_iter().enumerate() {
         println!("--- {extra_label} (32 BVH calls in traversal loop, dynamic sort, mem_windows=4) ---");
         let (mut bd, mut bp, mut sd, mut sp) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let (mut bs, mut ss) = (None, None);
-        for run in 0..3u32 {
-            let t0 = translate(&build_prog(base_salt.wrapping_add(run * 2), 32), &opt).unwrap();
-            assert!(t0.complete(), "{:?}", t0.unsupported_why);
-            let t1 = translate(&build_prog(base_salt.wrapping_add(run * 2 + 1), 32), &opt).unwrap();
-            let b = compile_and_time(&patch_baseline(&t0.hlsl), extra);
-            let s = compile_and_time(&t1.hlsl, extra);
+        for run in 0..4u32 {
+            let salt = base_salt.wrapping_add(mode_index as u32 * 4 + run);
+            let translated = translate(&build_prog(salt, 32), &opt).unwrap();
+            assert!(translated.complete(), "{:?}", translated.unsupported_why);
+            let baseline = patch_baseline(&translated.hlsl);
+            let order = if run % 2 == 0 { "Base/Scal" } else { "Scal/Base" };
+            println!("  pair {run}: salt={salt:#x} order={order}");
+            let (b, s) = if run % 2 == 0 {
+                (compile_and_time(&baseline, extra), compile_and_time(&translated.hlsl, extra))
+            } else {
+                let s = compile_and_time(&translated.hlsl, extra);
+                (compile_and_time(&baseline, extra), s)
+            };
             print_row("Base", run, &b);
             print_row("Scal", run, &s);
             bd.push(b.6); bp.push(b.7); sd.push(s.6); sp.push(s.7);
@@ -9647,7 +9660,7 @@ fn bench_cold_bvh_intersect_pso() {
         let (bd, sd, bp, sp) = (median(bd), median(sd), median(bp), median(sp));
         let (bs, ss) = (bs.unwrap(), ss.unwrap());
         println!(
-            "  MEDIAN {extra_label}: dxil {}B -> {}B ({:+.1}%), lines {} -> {}, alloca {} -> {}, br {} -> {}, dxc {:.1}ms -> {:.1}ms ({:+.1}%), cold_pso {:.2}ms -> {:.2}ms ({:+.1}%)",
+            "  MEDIAN {extra_label}: dxil {}B -> {}B ({:+.1}%), lines {} -> {}, alloca {} -> {}, br {} -> {}, dxc {:.1}ms -> {:.1}ms ({:+.1}%), first_pso {:.2}ms -> {:.2}ms ({:+.1}%)",
             bs.0, ss.0, (ss.0 as f64 / bs.0 as f64 - 1.0) * 100.0,
             bs.1, ss.1, bs.2, ss.2, bs.4, ss.4,
             bd, sd, (sd / bd - 1.0) * 100.0,
